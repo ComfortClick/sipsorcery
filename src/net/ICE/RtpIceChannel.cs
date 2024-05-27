@@ -1431,6 +1431,12 @@ namespace SIPSorcery.Net
                     supportsIPv6 = base.RtpSocket.AddressFamily == AddressFamily.InterNetworkV6 || base.IsDualMode;
                 }
 
+
+                if (remoteCandidateIPAddr == null)
+                {
+                    return;
+                }
+
                 lock (_checklist)
                 {
                     if (remoteCandidateIPAddr.AddressFamily == AddressFamily.InterNetwork && supportsIPv4 ||

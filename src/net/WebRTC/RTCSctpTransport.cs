@@ -21,6 +21,7 @@ using System.Net.Sockets;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Org.BouncyCastle.Crypto.Tls;
+using Org.BouncyCastle.Tls;
 using SIPSorcery.Sys;
 
 namespace SIPSorcery.Net
@@ -375,7 +376,14 @@ namespace SIPSorcery.Net
             {
                 lock (transport)
                 {
-                    transport.Send(buffer, offset, length);
+                    try
+                    {
+                        transport.Send(buffer, offset, length);
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e);
+                    }
                 }
             }
         }

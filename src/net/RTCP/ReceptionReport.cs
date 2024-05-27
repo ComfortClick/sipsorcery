@@ -113,6 +113,11 @@ namespace SIPSorcery.Net
 
         public ReceptionReportSample(byte[] packet)
         {
+            if (packet.Length < 7)
+            {
+                return;
+            }
+
             if (BitConverter.IsLittleEndian)
             {
                 SSRC = NetConvert.DoReverseEndian(BitConverter.ToUInt32(packet, 0));

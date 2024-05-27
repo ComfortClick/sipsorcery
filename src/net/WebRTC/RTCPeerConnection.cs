@@ -43,9 +43,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using SIPSorcery.net.RTP;
-using Org.BouncyCastle.Crypto.Tls;
 using SIPSorcery.SIP.App;
 using SIPSorcery.Sys;
+using Org.BouncyCastle.Tls;
+using Org.BouncyCastle.Tls.Crypto.Impl.BC;
 
 namespace SIPSorcery.Net
 {
@@ -161,8 +162,6 @@ namespace SIPSorcery.Net
         private const string NORMAL_CLOSE_REASON = "normal";
         private const ushort SCTP_DEFAULT_PORT = 5000;
         private const string UNKNOWN_DATACHANNEL_ERROR = "unknown";
-        public const int RTP_HEADER_EXTENSION_ID_ABS_SEND_TIME = 2;
-        public const string RTP_HEADER_EXTENSION_URI_ABS_SEND_TIME = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
 
         /// <summary>
         /// The period to wait for the SCTP association to complete before giving up.
@@ -184,8 +183,9 @@ namespace SIPSorcery.Net
         readonly RTCDataChannelCollection dataChannels;
         public IReadOnlyCollection<RTCDataChannel> DataChannels => dataChannels;
 
-        private Org.BouncyCastle.Crypto.Tls.Certificate _dtlsCertificate;
+        private Org.BouncyCastle.Tls.Certificate _dtlsCertificate;
         private Org.BouncyCastle.Crypto.AsymmetricKeyParameter _dtlsPrivateKey;
+        private BcTlsCrypto _crypto;
         private DtlsSrtpTransport _dtlsHandle;
         private Task _iceGatheringTask;
 
@@ -386,8 +386,9 @@ namespace SIPSorcery.Net
         public RTCPeerConnection(RTCConfiguration configuration, int bindPort = 0, PortRange portRange = null, Boolean videoAsPrimary = false) :
             base(true, true, true, configuration?.X_BindAddress, bindPort, portRange)
         {
+            _crypto = new BcTlsCrypto();
             dataChannels = new RTCDataChannelCollection(useEvenIds: () => _dtlsHandle.IsClient);
-            
+
             if (_configuration != null &&
                _configuration.iceTransportPolicy == RTCIceTransportPolicy.relay &&
                _configuration.iceServers?.Count == 0)
@@ -399,7 +400,7 @@ namespace SIPSorcery.Net
             {
                 _configuration = configuration;
 
-                if (!InitializeCertificates(configuration) && !InitializeCertificates2(configuration))
+                if (!InitializeCertificates2(configuration))
                 {
                     logger.LogWarning("No DTLS certificate is provided in the configuration");
                 }
@@ -417,7 +418,7 @@ namespace SIPSorcery.Net
             if (_dtlsCertificate == null)
             {
                 // No certificate was provided so create a new self signed one.
-                (_dtlsCertificate, _dtlsPrivateKey) = DtlsUtils.CreateSelfSignedTlsCert();
+                (_dtlsCertificate, _dtlsPrivateKey) = DtlsUtils.CreateSelfSignedTlsCert(_crypto);
             }
 
             DtlsCertificateFingerprint = DtlsUtils.Fingerprint(_dtlsCertificate);
@@ -438,7 +439,7 @@ namespace SIPSorcery.Net
 
             OnRtpClosed += Close;
             OnRtcpBye += Close;
-            
+
             //Cancel Negotiation Task Event to Prevent Duplicated Calls
             onnegotiationneeded += CancelOnNegotiationNeededTask;
 
@@ -453,55 +454,6 @@ namespace SIPSorcery.Net
             _iceGatheringTask = Task.Run(_rtpIceChannel.StartGathering);
         }
 
-        private bool InitializeCertificates(RTCConfiguration configuration)
-        {
-            if (configuration.certificates == null || configuration.certificates.Count == 0)
-            {
-                return false;
-            }
-
-            // Find the first certificate that has a usable private key.
-#pragma warning disable CS0618 // Type or member is obsolete
-            RTCCertificate usableCert = null;
-#pragma warning restore CS0618 // Type or member is obsolete
-            foreach (var cert in _configuration.certificates)
-            {
-                // Attempting to check that a certificate has an exportable private key.
-                // TODO: Does not seem to be a particularly reliable way of checking private key exportability.
-                if (cert.Certificate.HasPrivateKey)
-                {
-                    //if (cert.Certificate.PrivateKey is RSACryptoServiceProvider)
-                    //{
-                    //    var rsa = cert.Certificate.PrivateKey as RSACryptoServiceProvider;
-                    //    if (!rsa.CspKeyContainerInfo.Exportable)
-                    //    {
-                    //        logger.LogWarning($"RTCPeerConnection was passed a certificate for {cert.Certificate.FriendlyName} with a non-exportable RSA private key.");
-                    //    }
-                    //    else
-                    //    {
-                    //        usableCert = cert;
-                    //        break;
-                    //    }
-                    //}
-                    //else
-                    //{
-                    usableCert = cert;
-                    break;
-                    //}
-                }
-            }
-
-            if (usableCert == null)
-            {
-                throw new ApplicationException("RTCPeerConnection was not able to find a certificate from the input configuration list with a usable private key.");
-            }
-
-            _dtlsCertificate = DtlsUtils.LoadCertificateChain(usableCert.Certificate);
-            _dtlsPrivateKey = DtlsUtils.LoadPrivateKeyResource(usableCert.Certificate);
-
-            return true;
-        }
-
         private bool InitializeCertificates2(RTCConfiguration configuration)
         {
             if (configuration.certificates2 == null || configuration.certificates2.Count == 0)
@@ -509,7 +461,7 @@ namespace SIPSorcery.Net
                 return false;
             }
 
-            _dtlsCertificate = new Certificate(new [] { configuration.certificates2[0].Certificate.CertificateStructure });
+            _dtlsCertificate = new Certificate(new[] { new BcTlsCertificate(_crypto, configuration.certificates2[0].Certificate.CertificateStructure) });
             _dtlsPrivateKey = configuration.certificates2[0].PrivateKey;
 
             return true;
@@ -518,7 +470,7 @@ namespace SIPSorcery.Net
         /// <summary>
         /// Event handler for ICE connection state changes.
         /// </summary>
-        /// <param name="iceState">The new ICE connection state.</param>
+        /// <param name="state">The new ICE connection state.</param>
         private async void IceConnectionStateChange(RTCIceConnectionState iceState)
         {
             oniceconnectionstatechange?.Invoke(iceConnectionState);
@@ -556,11 +508,14 @@ namespace SIPSorcery.Net
                     logger.LogInformation($"ICE connected to remote end point {connectedEP}.");
 
                     bool disableDtlsExtendedMasterSecret = _configuration != null && _configuration.X_DisableExtendedMasterSecretKey;
+
+
+
                     _dtlsHandle = new DtlsSrtpTransport(
                                 IceRole == IceRolesEnum.active ?
-                                new DtlsSrtpClient(_dtlsCertificate, _dtlsPrivateKey)
+                                new DtlsSrtpClient(_crypto, _dtlsCertificate, _dtlsPrivateKey)
                                 { ForceUseExtendedMasterSecret = !disableDtlsExtendedMasterSecret } :
-                                (IDtlsSrtpPeer)new DtlsSrtpServer(_dtlsCertificate, _dtlsPrivateKey)
+                                (IDtlsSrtpPeer)new DtlsSrtpServer(_crypto, _dtlsCertificate, _dtlsPrivateKey)
                                 { ForceUseExtendedMasterSecret = !disableDtlsExtendedMasterSecret }
                                 );
 
@@ -624,6 +579,7 @@ namespace SIPSorcery.Net
         /// Creates a new RTP ICE channel (which manages the UDP socket sending and receiving RTP
         /// packets) for use with this session.
         /// </summary>
+        /// <param name="mediaType">The type of media the RTP channel is for. Must be audio or video.</param>
         /// <returns>A new RTPChannel instance.</returns>
         protected override RTPChannel CreateRtpChannel()
         {
@@ -771,7 +727,8 @@ namespace SIPSorcery.Net
 
                 SdpSessionID = remoteSdp.SessionId;
 
-                if (remoteSdp.IceImplementation == IceImplementationEnum.lite) {
+                if (remoteSdp.IceImplementation == IceImplementationEnum.lite)
+                {
                     _rtpIceChannel.IsController = true;
                 }
                 if (init.type == RTCSdpType.answer)
@@ -874,21 +831,12 @@ namespace SIPSorcery.Net
             {
                 logger.LogDebug($"Peer connection closed with reason {(reason != null ? reason : "<none>")}.");
 
-                // Close all DataChannels
-                if (DataChannels?.Count >0)
-                {
-                    foreach(var dc in DataChannels)
-                    {
-                        dc?.close();
-                    }
-                }
-
                 _rtpIceChannel?.Close();
                 _dtlsHandle?.Close();
 
                 sctp?.Close();
 
-                base.Close(reason); // Here Audio and/or Video Streams are closed
+                base.Close(reason);
 
                 connectionState = RTCPeerConnectionState.closed;
                 onconnectionstatechange?.Invoke(RTCPeerConnectionState.closed);
@@ -925,16 +873,6 @@ namespace SIPSorcery.Net
 
             bool excludeIceCandidates = options != null && options.X_ExcludeIceCandidates;
             var offerSdp = createBaseSdp(mediaStreamList, excludeIceCandidates);
-
-            foreach (var mediaStream in offerSdp.Media)
-            {
-                // when creating offer, tell that we support abs-send-time
-                mediaStream.HeaderExtensions.Add(
-                    RTP_HEADER_EXTENSION_ID_ABS_SEND_TIME,
-                    new RTPHeaderExtension(
-                        RTP_HEADER_EXTENSION_ID_ABS_SEND_TIME, 
-                        RTP_HEADER_EXTENSION_URI_ABS_SEND_TIME));
-            }
 
             foreach (var ann in offerSdp.Media)
             {
@@ -1016,21 +954,6 @@ namespace SIPSorcery.Net
                 bool excludeIceCandidates = options != null && options.X_ExcludeIceCandidates;
                 var answerSdp = createBaseSdp(mediaStreamList, excludeIceCandidates);
 
-                foreach (var media in answerSdp.Media)
-                {
-                    var remoteMedia = remoteDescription.sdp.Media.FirstOrDefault(m => m.MediaID == media.MediaID);
-                    // when creating answer, copy abs-send-time ext only if the media in offer contained it
-                    if (remoteMedia != null)
-                    {
-                        foreach (var kv in 
-                                 remoteMedia.HeaderExtensions.Where(kv => 
-                                     kv.Value.Uri == RTP_HEADER_EXTENSION_URI_ABS_SEND_TIME))
-                        {
-                            media.HeaderExtensions.Add(kv.Key, kv.Value);
-                        }
-                    }
-                }
-
                 //if (answerSdp.Media.Any(x => x.Media == SDPMediaTypesEnum.audio))
                 //{
                 //    var audioAnnouncement = answerSdp.Media.Where(x => x.Media == SDPMediaTypesEnum.audio).Single();
@@ -1104,7 +1027,7 @@ namespace SIPSorcery.Net
 
             string dtlsFingerprint = this.DtlsCertificateFingerprint.ToString();
             bool iceCandidatesAdded = false;
-            
+
 
             // Local function to add ICE candidates to one of the media announcements.
             void AddIceCandidates(SDPMediaAnnouncement announcement)
@@ -1147,7 +1070,7 @@ namespace SIPSorcery.Net
                 }
                 else
                 {
-                    if(mediaStream.LocalTrack.Kind == SDPMediaTypesEnum.audio)
+                    if (mediaStream.LocalTrack.Kind == SDPMediaTypesEnum.audio)
                     {
                         (mindex, midTag) = RemoteDescription.GetIndexForMediaType(mediaStream.LocalTrack.Kind, audioMediaIndex);
                         audioMediaIndex++;
@@ -1257,7 +1180,7 @@ namespace SIPSorcery.Net
         }
 
         /// <summary>
-        /// From RFC5764: <![CDATA[
+        /// From RFC5764:
         ///             +----------------+
         ///             | 127 < B< 192  -+--> forward to RTP
         ///             |                |
@@ -1265,7 +1188,6 @@ namespace SIPSorcery.Net
         ///             |                |
         ///             |       B< 2    -+--> forward to STUN
         ///             +----------------+
-        /// ]]>
         /// </summary>
         /// <paramref name="localPort">The local port on the RTP socket that received the packet.</paramref>
         /// <param name="remoteEP">The remote end point the packet was received from.</param>
@@ -1314,7 +1236,7 @@ namespace SIPSorcery.Net
         /// example is when a machine is behind a 1:1 NAT and the application wants a host 
         /// candidate with the public IP address to be included.
         /// </summary>
-        /// <param name="candidate">The ICE candidate to add.</param>
+        /// <param name="candidateInit">The ICE candidate to add.</param>
         /// <example>
         /// var natCandidate = new RTCIceCandidate(RTCIceProtocol.udp, natAddress, natPort, RTCIceCandidateType.host);
         /// pc.addLocalIceCandidate(natCandidate);
@@ -1538,6 +1460,10 @@ namespace SIPSorcery.Net
         /// <summary>
         /// Event handler for an SCTP DATA chunk being received on the SCTP association.
         /// </summary>
+        /// <param name="streamID">The stream ID of the chunk.</param>
+        /// <param name="streamSeqNum">The stream sequence number of the chunk. Will be 0 for unordered streams.</param>
+        /// <param name="ppID">The payload protocol ID for the chunk.</param>
+        /// <param name="data">The chunk data.</param>
         private void OnSctpAssociationDataChunk(SctpDataFrame frame)
         {
             if (dataChannels.TryGetChannel(frame.StreamID, out var dc))
@@ -1666,7 +1592,8 @@ namespace SIPSorcery.Net
         /// <param name="dataChannel">The data channel to open.</param>
         private void OpenDataChannel(RTCDataChannel dataChannel)
         {
-            if (dataChannel.negotiated) {
+            if (dataChannel.negotiated)
+            {
                 logger.LogDebug($"WebRTC data channel negotiated out of band with label {dataChannel.label} and stream ID {dataChannel.id}; invoking open event");
                 dataChannel.GotAck();
             }
@@ -1732,7 +1659,7 @@ namespace SIPSorcery.Net
                         dtlsHandle.ProtectRTCP,
                         dtlsHandle.UnprotectRTCP);
 
-                        
+
                     IsDtlsNegotiationComplete = true;
 
                     return true;

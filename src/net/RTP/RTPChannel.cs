@@ -260,7 +260,14 @@ namespace SIPSorcery.Net
 
         protected virtual void CallOnPacketReceivedCallback(int localPort, IPEndPoint remoteEndPoint, byte[] packet)
         {
-            OnPacketReceived?.Invoke(this, localPort, remoteEndPoint, packet);
+            try
+            {
+                OnPacketReceived?.Invoke(this, localPort, remoteEndPoint, packet);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e);
+            }
         }
     }
 
